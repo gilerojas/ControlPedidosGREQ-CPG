@@ -1,13 +1,11 @@
 /**
  * ═══════════════════════════════════════════════════════════════
- * QCBRIDGE v2.3 - SISTEMA CPG → CCG
+ * QCBRIDGE v2.4 - SISTEMA CPG → CCG
  * Flujo: Ventas → Calidad (con validación de QC)
- * 
- * UPDATES v2.3:
- * - Simple trigger onEdit() (multi-usuario)
- * - WhatsApp con mention a Mauro
- * - Formato mejorado (estilo construirMensaje)
- * - Trigger duplicado eliminado
+ *
+ * v2.4: Lock + doble verificación para evitar duplicados en CCG
+ *       (trigger puede dispararse 2 veces en una misma edición).
+ * v2.3: WhatsApp con mention a Mauro, formato mensaje.
  * ═══════════════════════════════════════════════════════════════
  */
 
@@ -65,12 +63,11 @@ function onEditQCBridge(e) {
   const estadoNuevo = range.getValue(); 
   const pedId = sheet.getRange(row, CONFIG_CPG.COL.PED_ID).getValue();
 
-  // Log de auditoría (Visible en la consola de Google Apps Script)
-  console.log(`[QCBridge] Edit detectado en Fila ${row}. Pedido: ${pedId}, Estado: ${estadoNuevo}`);
+  Logger.log(`[QCBridge] Edit detectado en Fila ${row}. Pedido: ${pedId}, Estado: ${estadoNuevo}`);
 
   // 5. Validaciones de salida
   if (!pedId || !estadoNuevo) {
-    console.warn(`[QCBridge] Abortado: Falta ID de pedido o el estado está vacío.`);
+    Logger.log("[QCBridge] Abortado: Falta ID de pedido o el estado está vacío.");
     return;
   }
 
@@ -78,11 +75,8 @@ function onEditQCBridge(e) {
   // FLUJO A: MANDAR A CALIDAD (CCG)
   // ══════════════════════════════════════════════════════════
   if (estadoNuevo === "PENDIENTE") {
-    // Reducimos el tiempo de espera a 2 segundos para dar tiempo a otros triggers 
-    // sin que Google mate la ejecución por exceso de tiempo.
-    Utilities.sleep(2000); 
-    
-    console.log(`[QCBridge] Iniciando envío a CCG para ID: ${pedId}`);
+    Utilities.sleep(1500);
+    Logger.log(`[QCBridge] Iniciando envío a CCG para ID: ${pedId}`);
     enviarACCG(pedId, sheet, row);
   }
 
@@ -93,7 +87,7 @@ function onEditQCBridge(e) {
     // e.oldValue suele ser confiable aquí para revertir si QC no ha aprobado
     const estadoAnt = e.oldValue || "LISTO P/ DESPACHAR";
     
-    console.log(`[QCBridge] Validando aprobación de QC para ID: ${pedId}`);
+    Logger.log(`[QCBridge] Validando aprobación de QC para ID: ${pedId}`);
     validarAprobacionRemota(e, pedId, estadoAnt, sheet, row);
   }
 }
@@ -104,56 +98,53 @@ function onEditQCBridge(e) {
 
 function enviarACCG(pedId, sheet, row) {
   try {
-    const ssCCG = SpreadsheetApp.openById(CONFIG_CPG.ID_ARCHIVO_CCG);
-    const shCCG = ssCCG.getSheetByName(CONFIG_CPG.NOMBRE_HOJA_CCG);
-    const shMetricas = ssCCG.getSheetByName(CONFIG_CPG.NOMBRE_HOJA_METRICAS_CCG);
-    
-    if (!shCCG) {
-      SpreadsheetApp.getActive().toast("❌ Hoja CCG no encontrada", "Error");
+    const lock = LockService.getScriptLock();
+    if (!lock.tryLock(12000)) {
+      Logger.log(`⚠️ [QCBridge] No se pudo obtener lock para ${pedId}, reintente más tarde.`);
       return;
     }
-    
-    const ids = shCCG.getRange("A:A").getValues().flat();
-    if (ids.includes(pedId)) {
-      Logger.log(`⚠️ ${pedId} ya existe en CCG`);
-      return;
+    try {
+      const ssCCG = SpreadsheetApp.openById(CONFIG_CPG.ID_ARCHIVO_CCG);
+      const shCCG = ssCCG.getSheetByName(CONFIG_CPG.NOMBRE_HOJA_CCG);
+      const shMetricas = ssCCG.getSheetByName(CONFIG_CPG.NOMBRE_HOJA_METRICAS_CCG);
+      if (!shCCG) {
+        SpreadsheetApp.getActive().toast("❌ Hoja CCG no encontrada", "Error");
+        return;
+      }
+      const ids = shCCG.getRange("A:A").getValues().flat().filter(function (v) { return v !== ""; });
+      if (ids.indexOf(pedId) !== -1) {
+        Logger.log(`⚠️ [QCBridge] ${pedId} ya existe en CCG (evitado duplicado).`);
+        return;
+      }
+      const cliente = sheet.getRange(row, CONFIG_CPG.COL.CLIENTE).getValue();
+      const producto = sheet.getRange(row, CONFIG_CPG.COL.PRODUCTO).getValue();
+      const color = sheet.getRange(row, CONFIG_CPG.COL.COLOR).getValue();
+      const cantidad = sheet.getRange(row, CONFIG_CPG.COL.CANTIDAD).getValue();
+      const unidad = sheet.getRange(row, CONFIG_CPG.COL.UNIDAD).getValue();
+      const glsTotales = calcularGalones(cantidad, unidad);
+      const rowDataCCG = [
+        pedId, cliente, producto, color, cantidad, unidad, glsTotales,
+        "PENDIENTE", "", "", "", "", "PENDIENTE", "", ""
+      ];
+      const newRow = shCCG.getLastRow() + 1;
+      shCCG.appendRow(rowDataCCG);
+      const dvOrigen = SpreadsheetApp.newDataValidation()
+        .requireValueInList(["PENDIENTE", "PRODUCCION", "STOCK", "MIXTO"])
+        .setAllowInvalid(false).build();
+      const dvEstado = SpreadsheetApp.newDataValidation()
+        .requireValueInList(["PENDIENTE", "APROBADO"])
+        .setAllowInvalid(false).build();
+      shCCG.getRange(newRow, CONFIG_CPG.COL_CCG.ORIGEN).setDataValidation(dvOrigen);
+      shCCG.getRange(newRow, CONFIG_CPG.COL_CCG.ESTADO_QC).setDataValidation(dvEstado);
+      if (shMetricas) {
+        shMetricas.appendRow([pedId, cliente, producto, color, "", new Date(), "", "", "", "", "", "", "", "", "", "", "", ""]);
+      }
+      notificarPedidoEnviadoCCG(pedId, sheet, row);
+      SpreadsheetApp.getActive().toast("✅ Enviado a Calidad", "GREQ");
+      Logger.log(`✅ ${pedId} → CCG`);
+    } finally {
+      lock.releaseLock();
     }
-    
-    const cliente = sheet.getRange(row, CONFIG_CPG.COL.CLIENTE).getValue();
-    const producto = sheet.getRange(row, CONFIG_CPG.COL.PRODUCTO).getValue();
-    const color = sheet.getRange(row, CONFIG_CPG.COL.COLOR).getValue();
-    const cantidad = sheet.getRange(row, CONFIG_CPG.COL.CANTIDAD).getValue();
-    const unidad = sheet.getRange(row, CONFIG_CPG.COL.UNIDAD).getValue();
-    const glsTotales = calcularGalones(cantidad, unidad);
-    
-    const rowDataCCG = [
-      pedId, cliente, producto, color, cantidad, unidad, glsTotales,
-      "PENDIENTE", "", "", "", "", "PENDIENTE", "", ""
-    ];
-    
-    const newRow = shCCG.getLastRow() + 1;
-    shCCG.appendRow(rowDataCCG);
-    
-    const dvOrigen = SpreadsheetApp.newDataValidation()
-      .requireValueInList(["PENDIENTE", "PRODUCCION", "STOCK", "MIXTO"])
-      .setAllowInvalid(false).build();
-    
-    const dvEstado = SpreadsheetApp.newDataValidation()
-      .requireValueInList(["PENDIENTE", "APROBADO"])
-      .setAllowInvalid(false).build();
-    
-    shCCG.getRange(newRow, CONFIG_CPG.COL_CCG.ORIGEN).setDataValidation(dvOrigen);
-    shCCG.getRange(newRow, CONFIG_CPG.COL_CCG.ESTADO_QC).setDataValidation(dvEstado);
-    
-    if (shMetricas) {
-      shMetricas.appendRow([pedId, cliente, producto, color, "", new Date(), "", "", "", "", "", "", "", "", "", "", "", ""]);
-    }
-    
-    notificarPedidoEnviadoCCG(pedId, sheet, row);
-    
-    SpreadsheetApp.getActive().toast("✅ Enviado a Calidad", "GREQ");
-    Logger.log(`✅ ${pedId} → CCG`);
-    
   } catch (err) {
     Logger.log(`❌ Error: ${err}`);
     SpreadsheetApp.getActive().toast("⚠️ Error enviando a Calidad", "Error");
@@ -247,7 +238,13 @@ function enviarWhatsAppConMention(mensaje, mentionJID) {
   const WAS_TOKEN = props.getProperty('WAS_TOKEN');
   const GROUP_ID = props.getProperty('GROUP_GREQ_TECNICO');
   
-  if (!WAS_TOKEN || !GROUP_ID) return;
+  if (!WAS_TOKEN || !GROUP_ID) {
+    const faltan = [];
+    if (!WAS_TOKEN) faltan.push("WAS_TOKEN");
+    if (!GROUP_ID) faltan.push("GROUP_GREQ_TECNICO");
+    Logger.log("⚠️ [QCBridge] WhatsApp NO enviado: faltan o están vacíos: " + faltan.join(", ") + ". Revisa Script Properties (Pedidos/CPG).");
+    return;
+  }
   
   const options = {
     method: 'post',
@@ -262,10 +259,23 @@ function enviarWhatsAppConMention(mensaje, mentionJID) {
   };
   
   try {
-    const response = UrlFetchApp.fetch("https://www.wasenderapi.com/api/send-message", options);
-    Logger.log(`📱 WhatsApp: ${response.getResponseCode()}`);
+    let response = UrlFetchApp.fetch("https://www.wasenderapi.com/api/send-message", options);
+    let code = response.getResponseCode();
+    Logger.log(`📱 [QCBridge] WhatsApp: ${code}`);
+    if (code !== 200) {
+      Logger.log(`📱 [QCBridge] Respuesta API: ${response.getContentText()}`);
+      // 429 = Too Many Requests → esperar y reintentar una vez
+      if (code === 429) {
+        Logger.log("📱 [QCBridge] Rate limit (429). Reintento en 8 segundos...");
+        Utilities.sleep(8000);
+        response = UrlFetchApp.fetch("https://www.wasenderapi.com/api/send-message", options);
+        code = response.getResponseCode();
+        Logger.log(`📱 [QCBridge] Reintento: ${code}`);
+        if (code !== 200) Logger.log(`📱 [QCBridge] Respuesta: ${response.getContentText()}`);
+      }
+    }
   } catch (error) {
-    Logger.log(`❌ WhatsApp: ${error}`);
+    Logger.log(`❌ [QCBridge] WhatsApp: ${error}`);
   }
 }
 
